@@ -42,7 +42,7 @@ int ParseSummarizeSpecSimple(RedisModuleString **argv, int argc, size_t *offset,
 
   const char *openTag = "";
   const char *closeTag = "";
-  uint32_t fragSize = 0;
+  uint32_t fragSize = SUMMARIZE_FRAGSIZE_DEFAULT;
 
   ++*offset;
 
@@ -96,20 +96,24 @@ static int parseSingleField(RedisModuleString **argv, int argc, size_t *offset, 
   const char *openTag = "";
   const char *closeTag = "";
   if (*offset == argc) {
+    printf("Not enough args\n");
     return REDISMODULE_ERR;
   }
 
   ReturnedField *field = FieldList_AddFieldR(fields, argv[(*offset)++]);
   fields->wantSummaries = 1;
   field->mode = SUMMARIZE_MODE_DEFAULT;
+  field->contextLen = SUMMARIZE_FRAGSIZE_DEFAULT;
 
   while (*offset != argc) {
     if (RMUtil_StringEqualsCaseC(argv[*offset], "TAGS")) {
       if (parseTags(argv, argc, offset, &openTag, &closeTag) != REDISMODULE_OK) {
+        printf("Bad tags!\n");
         return REDISMODULE_ERR;
       }
     } else if (RMUtil_StringEqualsCaseC(argv[*offset], "FRAGSIZE")) {
       if (parseFragsize(argv, argc, offset, &field->contextLen) != REDISMODULE_OK) {
+        printf("Bad fragsize\n");
         return REDISMODULE_ERR;
       }
     } else if (RMUtil_StringEqualsCaseC(argv[*offset], "ALL")) {
@@ -122,8 +126,7 @@ static int parseSingleField(RedisModuleString **argv, int argc, size_t *offset, 
       field->mode = SummarizeMode_WholeField;
       ++*offset;
     } else {
-      // Unknown field?
-      return REDISMODULE_ERR;
+      break;
     }
   }
 
@@ -134,10 +137,21 @@ static int parseSingleField(RedisModuleString **argv, int argc, size_t *offset, 
 
 int ParseSummarizeSpecDetailed(RedisModuleString **argv, int argc, size_t *offset,
                                FieldList *fields) {
+  if (argc - *offset < 3) {
+    return REDISMODULE_ERR;
+  }
+
+  size_t numFields = 0;
+
+  ++*offset;
+
   while (*offset != argc) {
     if (!RMUtil_StringEqualsCaseC(argv[*offset], "FIELD")) {
-      return REDISMODULE_ERR;
+      printf("Unknown arg %s\n", RedisModule_StringPtrLen(argv[*offset], NULL));
+      return numFields == 0 ? REDISMODULE_ERR : REDISMODULE_OK;
     }
+
+    ++numFields;
     if (parseSingleField(argv, argc, offset, fields) != REDISMODULE_OK) {
       return REDISMODULE_ERR;
     }
