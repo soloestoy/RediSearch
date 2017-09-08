@@ -15,6 +15,7 @@
 #include "ext/default.h"
 #include "rmutil/sds.h"
 #include "concurrent_ctx.h"
+#include "result_termoffsets.h"
 
 #define MAX_PREFIX_EXPANSIONS 200
 
@@ -453,7 +454,9 @@ Query *NewQueryFromRequest(RSSearchRequest *req) {
                req->slop, req->flags & Search_InOrder, req->scorer, req->payload, req->sortBy);
 
   q->docTable = &req->sctx->spec->docs;
-
+  if (req->fields.wantSummaries) {
+    q->needSummaries = 1;
+  }
   return q;
 }
 
@@ -692,7 +695,23 @@ typedef struct {
   t_docId docId;
   double score;
   RSSortingVector *sv;
+  ResultTermOffsets *offsets;
 } heapResult;
+
+static void heapResult_Free(heapResult *h) {
+  if (h->offsets) {
+    ResultTermOffsets_Free(h->offsets);
+    free(h->offsets);
+    h->offsets = NULL;
+  }
+  free(h);
+}
+
+static heapResult *newHeapResult() {
+  heapResult *r = malloc(sizeof(*r));
+  r->offsets = NULL;
+  return r;
+}
 
 /* Compare hits for sorting in the heap during traversal of the top N */
 static inline int cmpHits(const void *e1, const void *e2, const void *udata) {
@@ -730,6 +749,25 @@ void Query_OnReopen(RedisModuleKey *k, void *privdata) {
   // The spec might have changed while we were sleeping - for example a realloc of the doc table
   q->ctx->spec = sp;
   q->docTable = &sp->docs;
+}
+
+static void ResultEntry_Init(ResultEntry *ent, heapResult *h, RSDocumentMetadata *dmd) {
+  *ent = (ResultEntry){
+      .id = dmd->key, .score = h->score, .payload = dmd->payload, .termOffsets = h->offsets};
+  h->offsets = NULL;
+  if (dmd->byteOffsets && ent->termOffsets) {
+    ResultTermOffsets_SetByteOffsets(ent->termOffsets, dmd->byteOffsets);
+  }
+}
+
+static void addTopHit(const Query *q, heap_t *heap, heapResult *h, const RSIndexResult *res) {
+  heap_offerx(heap, h);
+  if (q->needSummaries) {
+    if (!h->offsets) {
+      h->offsets = calloc(1, sizeof(*h->offsets));
+    }
+    ResultTermOffsets_Init(h->offsets, res);
+  }
 }
 
 QueryResult *Query_Execute(Query *query) {
@@ -778,7 +816,7 @@ QueryResult *Query_Execute(Query *query) {
   while (1) {
     // TODO - Use static allocation
     if (pooledHit == NULL) {
-      pooledHit = malloc(sizeof(heapResult));
+      pooledHit = newHeapResult();
     }
     heapResult *h = pooledHit;
 
@@ -819,7 +857,7 @@ QueryResult *Query_Execute(Query *query) {
     if (query->aborted) goto cleanup;
 
     if (heap_count(pq) < heap_size(pq)) {
-      heap_offerx(pq, h);
+      addTopHit(query, pq, h, r);
       pooledHit = NULL;
       if (heap_count(pq) == heap_size(pq)) {
         heapResult *minh = heap_peek(pq);
@@ -833,7 +871,7 @@ QueryResult *Query_Execute(Query *query) {
         /* if the current hit should be in the heap - remoe the lowest hit and add the new hit */
         if (sortByCmp(h, minh, query->sortKey) < 0) {
           pooledHit = heap_poll(pq);
-          heap_offerx(pq, h);
+          addTopHit(query, pq, h, r);
         } else {
           /* The current should not enter the pool, so just leave it as is */
           pooledHit = h;
@@ -849,7 +887,7 @@ QueryResult *Query_Execute(Query *query) {
           if (h->score > minScore || cmpHits(h, heap_peek(pq), NULL) < 0) {
 
             pooledHit = heap_poll(pq);
-            heap_offerx(pq, h);
+            addTopHit(query, pq, h, r);
 
             // get the new min score
             minScore = ((heapResult *)heap_peek(pq))->score;
@@ -864,7 +902,7 @@ QueryResult *Query_Execute(Query *query) {
   //  IndexResult_Free(r);
   if (pooledHit) {
     // IndexResult_Free(pooledHit);
-    free(pooledHit);
+    heapResult_Free(pooledHit);
     pooledHit = NULL;
   }
   res->totalResults = it->Len(it->ctx) - numDeleted;
@@ -898,17 +936,18 @@ QueryResult *Query_Execute(Query *query) {
           sv = RSSortingVector_Get(h->sv, query->sortKey);
         }
       }
-      res->results[n - i - 1] =
-          (ResultEntry){.id = dmd->key, .score = h->score, .payload = dmd->payload, .sortKey = sv};
+      ResultEntry *entry = res->results + (n - i - 1);
+      ResultEntry_Init(entry, h, dmd);
+      entry->sortKey = sv;
     }
-    free(h);
+    heapResult_Free(h);
   }
 
 cleanup:
   // if we still have something in the heap (meaning offset > 0), we need to poll...
   while (heap_count(pq) > 0) {
     heapResult *h = heap_poll(pq);
-    free(h);
+    heapResult_Free(h);
   }
 
   heap_free(pq);
@@ -916,6 +955,12 @@ cleanup:
 }
 
 void QueryResult_Free(QueryResult *q) {
+  for (size_t ii = 0; ii < q->numResults; ++ii) {
+    if (q->results[ii].termOffsets) {
+      ResultTermOffsets_Free(q->results[ii].termOffsets);
+      free(q->results[ii].termOffsets);
+    }
+  }
   free(q->results);
   free(q);
 }

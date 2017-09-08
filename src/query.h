@@ -17,6 +17,7 @@
 #include "rmutil/sds.h"
 #include "search_request.h"
 #include "concurrent_ctx.h"
+#include "result_termoffsets.h"
 
 /* A Query represents the parse tree and execution plan for a single search
  * query */
@@ -53,6 +54,9 @@ typedef struct RSQuery {
 
   int concurrentMode;
 
+  // Whether summaries are required. This causes some more results to be cached.
+  int needSummaries;
+
   // Query expander
   RSQueryTokenExpander expander;
   RSFreeFunction expanderFree;
@@ -82,6 +86,7 @@ typedef struct {
   double score;
   RSPayload *payload;
   RSSortableValue *sortKey;
+  ResultTermOffsets *termOffsets;
 } ResultEntry;
 
 /* QueryResult represents the final processed result of a query execution */
