@@ -10,9 +10,264 @@
 #include "rmalloc.h"
 #include "summarize_spec.h"
 #include <sys/param.h>
+#include <assert.h>
+
+/**
+ * Handler signature. argv and argc are the original arguments passed (for the
+ * entire query). offset contains the index of the keyword for this handler.
+ * The first argument to the keyword will be at argv[*offset + 1].
+ *
+ * On return, offset should contain the index of the first token *not* handled
+ * by the handler.
+ *
+ * The function should return REDISMODULE_{OK,ERR} as a status.
+ * errStr assignment is optional. If errStr is not assigned, the default
+ * handler's errStr (i.e. KeywordHandler::errStr) will be used instead.
+ */
+typedef int (*KeywordParser)(RedisModuleString **argv, int argc, size_t *offset,
+                             RSSearchRequest *req, RedisSearchCtx *sctx, char **errStr);
+
+typedef struct {
+  // The keyword this parser handles
+  const char *keyword;
+
+  // Static error string to use
+  const char *errStr;
+
+  // Minimum number of arguments required. This number does not count the
+  // actual keyword itself (unlike the `offset` parameter passed to the
+  // handler)
+  size_t minArgs;
+
+  // The actual parser
+  KeywordParser parser;
+} KeywordHandler;
+
+#define KEYWORD_HANDLER(name)                                                               \
+  static int name(RedisModuleString **argv, int argc, size_t *offset, RSSearchRequest *req, \
+                  RedisSearchCtx *sctx, char **errStr)
+
+KEYWORD_HANDLER(parseLimit) {
+  ++*offset;
+
+  // FIXME: The previous code passed a size_t* as a long long*. This should work
+  // fine for smaller values, but might throw things off balance otherwise.
+  if (RMUtil_ParseArgs(argv, argc, *offset, "ll", &req->offset, &req->num) != REDISMODULE_OK) {
+    // printf("Couldn't parse limit\n");
+    return REDISMODULE_ERR;
+  }
+
+  if (req->num <= 0) {
+    *errStr = "LIMIT: Limit or offset too large";
+    return REDISMODULE_ERR;
+  }
+
+  *offset += 2;
+  return REDISMODULE_OK;
+}
+
+KEYWORD_HANDLER(parseInfields) {
+  size_t nargs;
+  RedisModuleString **vargs = RMUtil_ParseVarArgs(argv, argc, *offset, "INFIELDS", &nargs);
+  assert(vargs != NULL);
+
+  if (nargs == RMUTIL_VARARGS_BADARG) {
+    return REDISMODULE_ERR;
+  }
+
+  req->fieldMask = IndexSpec_ParseFieldMask(sctx->spec, vargs, nargs);
+  RedisModule_Log(sctx->redisCtx, "debug", "Parsed field mask: 0x%x", req->fieldMask);
+  // Add 2 (the keyword and number of args) to the args themselves
+  *offset += 2 + nargs;
+  return REDISMODULE_OK;
+}
+
+// {field} {min} {max}
+KEYWORD_HANDLER(parseNumericFilter) {
+  if (req->numericFilters == NULL) {
+    req->numericFilters = NewVector(NumericFilter *, 2);
+  }
+
+  ++*offset;
+  NumericFilter *flt = ParseNumericFilter(sctx, argv + *offset, 3);
+  if (flt == NULL) {
+    return REDISMODULE_ERR;
+  }
+
+  Vector_Push(req->numericFilters, flt);
+  *offset += 3;
+  // printf("Parsed filter: %f, %f\n", flt->min, flt->max);
+  return REDISMODULE_OK;
+}
+
+KEYWORD_HANDLER(parseGeoFilter) {
+  if (!req->geoFilter) {
+    req->geoFilter = malloc(sizeof(*req->geoFilter));
+  }
+
+  ++*offset;
+  int rv = GeoFilter_Parse(req->geoFilter, argv + *offset, 5);
+  *offset += 5;
+  return rv;
+}
+
+KEYWORD_HANDLER(parseSlop) {
+  long long tmp;
+  int rv = RedisModule_StringToLongLong(argv[++*offset], &tmp);
+  req->slop = tmp;
+  req->flags |= Search_HasSlop;
+  ++*offset;
+  return rv;
+}
+
+KEYWORD_HANDLER(parseLanguage) {
+  // make sure we search for "language" only after the query
+  const char *langTmp = RedisModule_StringPtrLen(argv[*offset], NULL);
+  if (!IsSupportedLanguage(langTmp, strlen(langTmp))) {
+    return REDISMODULE_ERR;
+  }
+  req->language = strdup(langTmp);
+  return REDISMODULE_OK;
+}
+
+KEYWORD_HANDLER(parseExpander) {
+  req->expander = strdup(RedisModule_StringPtrLen(argv[++*offset], NULL));
+  ++*offset;
+  return REDISMODULE_OK;
+}
+
+KEYWORD_HANDLER(handlePayload) {
+  const char *payload = RedisModule_StringPtrLen(argv[(*offset)++], &req->payload.len);
+  if (req->payload.len) {
+    req->payload.data = malloc(req->payload.len);
+    memcpy(req->payload.data, payload, req->payload.len);
+  }
+  ++*offset;
+  return REDISMODULE_OK;
+}
+
+KEYWORD_HANDLER(handleScorer) {
+  req->scorer = strdup(RedisModule_StringPtrLen(argv[++*offset], NULL));
+  if (Extensions_GetScoringFunction(NULL, req->scorer) == NULL) {
+    *errStr = "Invalid scorer name";
+    return REDISMODULE_ERR;
+  }
+  ++*offset;
+  return REDISMODULE_OK;
+}
+
+KEYWORD_HANDLER(handleSummarize) {
+  return ParseSummarizeSpecSimple(argv, argc, offset, &req->fields);
+}
+
+KEYWORD_HANDLER(handleExtendedHighlighter) {
+  ++*offset;
+  if (!RMUtil_StringEqualsCaseC(argv[*offset], "DEFAULT")) {
+    *errStr = "Unknown highlighter";
+    return REDISMODULE_ERR;
+  }
+  return ParseSummarizeSpecDetailed(argv, argc, offset, &req->fields);
+}
+
+KEYWORD_HANDLER(handleSortBy) {
+  RSSortingKey sortKey;
+  int rc = RSSortingTable_ParseKey(sctx->spec->sortables, &sortKey, argv, argc, offset);
+  if (rc == REDISMODULE_OK) {
+    req->sortBy = malloc(sizeof(sortKey));
+    *req->sortBy = sortKey;
+  }
+  return rc;
+}
+
+KEYWORD_HANDLER(handleInkeys) {
+  size_t nargs;
+  RedisModuleString **vargs = RMUtil_ParseVarArgs(argv, argc, 2, "INKEYS", &nargs);
+  if (vargs == NULL || nargs == RMUTIL_VARARGS_BADARG) {
+    return REDISMODULE_ERR;
+  }
+  req->idFilter = NewIdFilter(vargs, nargs, &sctx->spec->docs);
+  *offset += 2 + nargs;
+  return REDISMODULE_OK;
+}
+
+KEYWORD_HANDLER(handleReturn) {
+  size_t nargs;
+  RedisModuleString **vargs = RMUtil_ParseVarArgs(argv, argc, 2, "RETURN", &nargs);
+  if (nargs == RMUTIL_VARARGS_BADARG) {
+    return REDISMODULE_ERR;
+  } else if (vargs == NULL || nargs == 0) {
+    req->flags |= Search_NoContent;
+  }
+
+  for (size_t ii = 0; ii < nargs; ++ii) {
+    FieldList_AddFieldR(&req->fields, vargs[ii]);
+  }
+  *offset += 2 + nargs;
+  return REDISMODULE_OK;
+}
+
+#define HANDLER_ENTRY(name, parser_, minArgs_)               \
+  {                                                          \
+    .keyword = name, .parser = parser_, .minArgs = minArgs_, \
+    .errStr = "Bad argument for `" name "`"                  \
+  }
+
+static const KeywordHandler keywordHandlers_g[] = {
+    HANDLER_ENTRY("LIMIT", parseLimit, 2),
+    HANDLER_ENTRY("INFIELDS", parseInfields, 1),
+    HANDLER_ENTRY("FILTER", parseNumericFilter, 3),
+    HANDLER_ENTRY("GEOFILTER", parseGeoFilter, 5),
+    HANDLER_ENTRY("SLOP", parseSlop, 1),
+    HANDLER_ENTRY("LANGUAGE", parseLanguage, 1),
+    HANDLER_ENTRY("EXPANDER", parseExpander, 1),
+    HANDLER_ENTRY("PAYLOAD", handlePayload, 1),
+    HANDLER_ENTRY("SCORER", handleScorer, 1),
+    HANDLER_ENTRY("SUMMARIZE", handleSummarize, 1),
+    HANDLER_ENTRY("HIGHLIGHTER", handleExtendedHighlighter, 1),
+    HANDLER_ENTRY("SORTBY", handleSortBy, 1),
+    HANDLER_ENTRY("INKEYS", handleInkeys, 1),
+    HANDLER_ENTRY("RETURN", handleReturn, 1)};
+
+#define NUM_HANDLERS (sizeof(keywordHandlers_g) / sizeof(keywordHandlers_g[0]))
+
+static int handleKeyword(RSSearchRequest *req, RedisSearchCtx *sctx, RedisModuleString **argv,
+                         int argc, size_t *offset, char **errStr) {
+
+  const KeywordHandler *handler = NULL;
+
+  for (size_t ii = 0; ii < NUM_HANDLERS; ++ii) {
+    if (RMUtil_StringEqualsCaseC(argv[*offset], keywordHandlers_g[ii].keyword)) {
+      handler = &keywordHandlers_g[ii];
+      break;
+    }
+  }
+
+  if (!handler) {
+    // printf("Unknown keyword %s\n", RedisModule_StringPtrLen(argv[*offset], NULL));
+    *errStr = "Unknown keyword";
+    return REDISMODULE_ERR;
+  }
+
+  if (argc - (*offset + 1) < handler->minArgs) {
+    // printf("Insufficient args for %s\n", RedisModule_StringPtrLen(argv[*offset], NULL));
+    *errStr = (char *)handler->errStr;
+    return REDISMODULE_ERR;
+  }
+
+  if (handler->parser(argv, argc, offset, req, sctx, errStr) != REDISMODULE_OK) {
+    if (!*errStr) {
+      *errStr = (char *)handler->errStr;
+    }
+    return REDISMODULE_ERR;
+  }
+
+  return REDISMODULE_OK;
+}
 
 RSSearchRequest *ParseRequest(RedisSearchCtx *ctx, RedisModuleString **argv, int argc,
                               char **errStr) {
+
+  *errStr = NULL;
 
   RSSearchRequest *req = calloc(1, sizeof(*req));
   *req = (RSSearchRequest){.sctx = NULL,
@@ -20,178 +275,56 @@ RSSearchRequest *ParseRequest(RedisSearchCtx *ctx, RedisModuleString **argv, int
                            .bc = NULL,
                            .offset = 0,
                            .num = 10,
+                           .payload = {.data = NULL, .len = 0},
                            .flags = RS_DEFAULT_QUERY_FLAGS,
                            .slop = -1,
                            .fieldMask = RS_FIELDMASK_ALL,
                            .sortBy = NULL};
 
-  // Detect "NOCONTENT"
-  if (RMUtil_ArgExists("NOCONTENT", argv, argc, 3)) req->flags |= Search_NoContent;
+#define CUR_ARG_EQ(s) RMUtil_StringEqualsCaseC(argv[offset], s)
 
-  // parse WISTHSCORES
-  if (RMUtil_ArgExists("WITHSCORES", argv, argc, 3)) req->flags |= Search_WithScores;
+#define CUR_ARG_EQ_INCR(s) (CUR_ARG_EQ(s) && ++offset)
 
-  // parse WITHPAYLOADS
-  if (RMUtil_ArgExists("WITHPAYLOADS", argv, argc, 3)) req->flags |= Search_WithPayloads;
-
-  // parse WITHSORTKEYS
-  if (RMUtil_ArgExists("WITHSORTKEYS", argv, argc, 3)) req->flags |= Search_WithSortKeys;
-
-  // Parse VERBATIM and LANGUAGE arguments
-  if (RMUtil_ArgExists("VERBATIM", argv, argc, 3)) req->flags |= Search_Verbatim;
-
-  // Parse NOSTOPWORDS argument
-  if (RMUtil_ArgExists("NOSTOPWORDS", argv, argc, 3)) req->flags |= Search_NoStopwrods;
-
-  if (RMUtil_ArgExists("INORDER", argv, argc, 3)) {
-    req->flags |= Search_InOrder;
-    // the slop will be parsed later, this is just the default when INORDER and no SLOP
-    req->slop = __INT_MAX__;
+#define ENSURE_ARG_REMAINS(argName)                 \
+  if (offset == argc) {                             \
+    *errStr = "Missing argument for `" argName "`"; \
+    goto err;                                       \
   }
 
-  int sumIdx;
-  if ((sumIdx = RMUtil_ArgExists("SUMMARIZE", argv, argc, 3)) > 0) {
-    size_t tmpOffset = sumIdx;
-    if (ParseSummarizeSpecSimple(argv, argc, &tmpOffset, &req->fields) != REDISMODULE_OK) {
-      *errStr = "Couldn't parse `SUMMARIZE`";
-      goto err;
-    }
-  }
+  size_t offset = 3;
 
-  if ((sumIdx = RMUtil_ArgExists("HIGHLIGHTER", argv, argc, 3)) > 0) {
-    // Parse the highlighter spec
-    size_t tmpOffset;
-    if (argc - sumIdx < 2) {
-      *errStr = "Not enough arguments for `HIGHLIGHTER";
-      goto err;
-    }
-    sumIdx++;
-    if (!RMUtil_StringEqualsCaseC(argv[sumIdx], "DEFAULT")) {
-      *errStr = "Unknown highlighter";
-      goto err;
-    }
-    tmpOffset = sumIdx;
-    if (ParseSummarizeSpecDetailed(argv, argc, &tmpOffset, &req->fields) != REDISMODULE_OK) {
-      *errStr = "Bad args for `HIGHLIGHTER DEFAULT`";
-      goto err;
-    }
-  }
-
-  // Parse LIMIT argument
-  long long first = 0, limit = 10;
-  RMUtil_ParseArgsAfter("LIMIT", argv, argc, "ll", &req->offset, &req->num);
-  if (req->num <= 0) {
-    *errStr = "Wrog Arity";
-    goto err;
-  }
-
-  RedisModuleString **vargs;
-  size_t nargs;
-
-  // if INFIELDS exists, parse the field mask
-  req->fieldMask = RS_FIELDMASK_ALL;
-  if ((vargs = RMUtil_ParseVarArgs(argv, argc, 3, "INFIELDS", &nargs))) {
-    if (nargs == RMUTIL_VARARGS_BADARG) {
-      *errStr = "Bad argument for `INFIELDS`";
-      goto err;
-    }
-    req->fieldMask = IndexSpec_ParseFieldMask(ctx->spec, vargs, nargs);
-    RedisModule_Log(ctx->redisCtx, "debug", "Parsed field mask: 0x%x", req->fieldMask);
-  }
-
-  // Parse numeric filter. currently only one supported
-  int filterIdx = RMUtil_ArgExists("FILTER", argv, argc, 3);
-  if (filterIdx > 0) {
-    req->numericFilters = ParseMultipleFilters(ctx, &argv[filterIdx], argc - filterIdx);
-    if (req->numericFilters == NULL) {
-      *errStr = "Invalid numeric filter";
-      goto err;
-    }
-  }
-
-  // parse geo filter if present
-  int gfIdx = RMUtil_ArgExists("GEOFILTER", argv, argc, 3);
-  if (gfIdx > 0 && gfIdx + 6 <= argc) {
-    req->geoFilter = malloc(sizeof(GeoFilter));
-    if (GeoFilter_Parse(req->geoFilter, &argv[gfIdx + 1], 5) == REDISMODULE_ERR) {
-      *errStr = "Invalid geo filter";
-      goto err;
-    }
-  }
-
-  RMUtil_ParseArgsAfter("SLOP", argv, argc, "l", &req->slop);
-
-  // make sure we search for "language" only after the query
-  if (argc > 3) {
-    RMUtil_ParseArgsAfter("LANGUAGE", &argv[3], argc - 3, "c", &req->language);
-    if (req->language && !IsSupportedLanguage(req->language, strlen(req->language))) {
-      *errStr = "Unsupported Stemmer Language";
-      req->language = NULL;
-      goto err;
-    }
-    if (req->language) req->language = strdup(req->language);
-  }
-
-  // parse the optional expander argument
-  if (argc > 3) {
-    RMUtil_ParseArgsAfter("EXPANDER", &argv[2], argc - 2, "c", &req->expander);
-  }
-  if (!req->expander) {
-    req->expander = DEFAULT_EXPANDER_NAME;
-  }
-  req->expander = strdup(req->expander);
-
-  // IF a payload exists, init it
-  req->payload = (RSPayload){.data = NULL, .len = 0};
-
-  if (argc > 3) {
-    RedisModuleString *ps = NULL;
-    RMUtil_ParseArgsAfter("PAYLOAD", &argv[2], argc - 2, "s", &ps);
-    if (ps) {
-
-      const char *data = RedisModule_StringPtrLen(ps, &req->payload.len);
-      req->payload.data = malloc(req->payload.len);
-      memcpy(req->payload.data, data, req->payload.len);
-    }
-  }
-
-  // parse SCORER argument
-
-  RMUtil_ParseArgsAfter("SCORER", &argv[3], argc - 3, "c", &req->scorer);
-  if (req->scorer) {
-    req->scorer = strdup(req->scorer);
-    if (Extensions_GetScoringFunction(NULL, req->scorer) == NULL) {
-      *errStr = "Invalid scorer name";
-      goto err;
-    }
-  }
-
-  // Parse SORTBY argument
-  RSSortingKey sortKey;
-  if (ctx->spec->sortables != NULL &&
-      RSSortingTable_ParseKey(ctx->spec->sortables, &sortKey, &argv[3], argc - 3)) {
-    req->sortBy = malloc(sizeof(RSSortingKey));
-    *req->sortBy = sortKey;
-  }
-
-  // parse the id filter arguments
-  if ((vargs = RMUtil_ParseVarArgs(argv, argc, 2, "INKEYS", &nargs))) {
-    if (nargs == RMUTIL_VARARGS_BADARG) {
-      *errStr = "Bad argument for `INKEYS`";
-      goto err;
-    }
-    req->idFilter = NewIdFilter(vargs, nargs, &ctx->spec->docs);
-  }
-
-  // parse RETURN argument
-  if ((vargs = RMUtil_ParseVarArgs(argv, argc, 2, "RETURN", &nargs))) {
-    if (!nargs) {
+  while (offset < argc) {
+    if (CUR_ARG_EQ_INCR("NOCONTENT")) {
       req->flags |= Search_NoContent;
+    } else if (CUR_ARG_EQ_INCR("WITHSCORES")) {
+      req->flags |= Search_WithScores;
+    } else if (CUR_ARG_EQ_INCR("WITHPAYLOADS")) {
+      req->flags |= Search_WithPayloads;
+    } else if (CUR_ARG_EQ_INCR("WITHSORTKEYS")) {
+      req->flags |= Search_WithSortKeys;
+    } else if (CUR_ARG_EQ_INCR("VERBATIM")) {
+      req->flags |= Search_Verbatim;
+    } else if (CUR_ARG_EQ_INCR("INORDER")) {
+      req->flags |= Search_InOrder;
     } else {
-      for (size_t ii = 0; ii < nargs; ++ii) {
-        FieldList_AddFieldR(&req->fields, vargs[ii]);
+      if (handleKeyword(req, ctx, argv, argc, &offset, errStr) != REDISMODULE_OK) {
+        goto err;
       }
     }
+  }
+
+  if ((req->flags & (Search_InOrder | Search_HasSlop)) == Search_InOrder) {
+    // default when INORDER and no SLOP
+    req->slop = INT_MAX;
+  }
+
+  if (req->fields.numFields > 0) {
+    // Clear NOCONTENT (implicit or explicit) if returned fields are requested
+    req->flags &= ~Search_NoContent;
+  }
+
+  if (!req->expander) {
+    req->expander = strdup(DEFAULT_EXPANDER_NAME);
   }
 
   req->rawQuery = (char *)RedisModule_StringPtrLen(argv[2], &req->qlen);

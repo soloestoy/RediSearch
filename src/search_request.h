@@ -20,6 +20,9 @@ typedef enum {
 
   Search_WithSortKeys = 0x40,
 
+  // Has the slop field specified.
+  Search_HasSlop = 0x80
+
 } RSSearchFlags;
 
 typedef enum {
@@ -61,7 +64,7 @@ typedef struct {
 
 #define RS_DEFAULT_QUERY_FLAGS 0x00
 
-typedef struct {
+typedef struct RSSearchRequest {
   /* The index name - since we need to open the spec in a side thread */
   char *indexName;
   /* RS Context */
